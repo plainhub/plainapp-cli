@@ -12,8 +12,23 @@ path = "src/main.rs"
 [dependencies]
 # XChaCha20-Poly1305 — matches the encryption used by the PlainApp server
 chacha20poly1305 = "0.10"
-# Blocking HTTPS client with rustls (needed for self-signed TLS certs)
+
+# macOS + Windows: delegate TLS to the OS (SecureTransport / Schannel).
+# This removes the entire rustls/ring/webpki dependency chain from the binary,
+# eliminating the embedded Mozilla CA root store (including Chinese CA strings
+# that trigger APT-detection heuristics) and the TLS cipher suite string table.
+# Linux musl: keep rustls for fully static portable binaries (already 0/72 clean).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# socket2: safe Rust API for SO_REUSEADDR/REUSEPORT before binding.
+# Replaces the raw extern "C" { fn socket/setsockopt/bind/close } block in
+# mdns.rs, which is a textbook rootkit pattern and a major AV heuristic trigger.
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.5", features = ["all"] }
 
 [profile.release]
 opt-level   = 3

@@ -75,15 +75,130 @@ jobs:
           path: ${{ matrix.asset_name }}
           if-no-files-found: error
 
+  # Collect all matrix binaries and compute hashes for SLSA provenance.
+  hashes:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA-256 hashes
+        id: hash
+        run: |
+          echo "hashes=$(sha256sum artifacts/* | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  # SLSA Level 3 provenance covers all release binaries.
+  provenance:
+    needs: hashes
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.hashes }}
+      upload-assets: false
+
+  # Scans all four binaries concurrently to minimise wall-clock time.
+  virustotal:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      arm64_report:      ${{ steps.scan.outputs.arm64_report }}
+      arm64_status:      ${{ steps.scan.outputs.arm64_status }}
+      x86_64_mac_report: ${{ steps.scan.outputs.x86_64_mac_report }}
+      x86_64_mac_status: ${{ steps.scan.outputs.x86_64_mac_status }}
+      linux_report:      ${{ steps.scan.outputs.linux_report }}
+      linux_status:      ${{ steps.scan.outputs.linux_status }}
+      windows_report:    ${{ steps.scan.outputs.windows_report }}
+      windows_status:    ${{ steps.scan.outputs.windows_status }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Scan with VirusTotal
+        id: scan
+        env:
+          VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          upload_and_poll() {
+            local file="$1" outprefix="$2"
+            local sha256 size_bytes upload_url analysis_id last_response poll_status
+            local malicious suspicious undetected harmless total detected result_status
+            sha256=$(sha256sum "$file" | awk '{print $1}')
+            size_bytes=$(stat -c%s "$file")
+            upload_url="https://www.virustotal.com/api/v3/files"
+            if [ "$size_bytes" -gt 33554432 ]; then
+              upload_url=$(curl -sS --request GET \
+                --url https://www.virustotal.com/api/v3/files/upload_url \
+                --header "x-apikey: $VT_API_KEY" | jq -r '.data')
+              if [ -z "$upload_url" ] || [ "$upload_url" = "null" ]; then
+                printf '%s' "https://www.virustotal.com/gui/file/$sha256/detection" > "${outprefix}.url"
+                printf '%s' "⬜ N/A" > "${outprefix}.status"
+                return
+              fi
+            fi
+            analysis_id=$(curl -sS --request POST \
+              --url "$upload_url" \
+              --header "x-apikey: $VT_API_KEY" \
+              --form "file=@$file" | jq -r '.data.id')
+            if [ -z "$analysis_id" ] || [ "$analysis_id" = "null" ]; then
+              printf '%s' "https://www.virustotal.com/gui/file/$sha256/detection" > "${outprefix}.url"
+              printf '%s' "⬜ N/A" > "${outprefix}.status"
+              return
+            fi
+            last_response=""
+            for i in $(seq 1 30); do
+              sleep 20
+              last_response=$(curl -sS \
+                --url "https://www.virustotal.com/api/v3/analyses/$analysis_id" \
+                --header "x-apikey: $VT_API_KEY")
+              poll_status=$(echo "$last_response" | jq -r '.data.attributes.status')
+              [ "$poll_status" = "completed" ] && break
+            done
+            malicious=$(echo  "$last_response" | jq -r '.data.attributes.stats.malicious   // 0')
+            suspicious=$(echo "$last_response" | jq -r '.data.attributes.stats.suspicious  // 0')
+            undetected=$(echo "$last_response" | jq -r '.data.attributes.stats.undetected  // 0')
+            harmless=$(echo   "$last_response" | jq -r '.data.attributes.stats.harmless    // 0')
+            total=$((malicious + suspicious + undetected + harmless))
+            detected=$((malicious + suspicious))
+            [ "$detected" -eq 0 ] \
+              && result_status="✅ ${detected}/${total} Clean" \
+              || result_status="⚠️ ${detected}/${total} Detected"
+            printf '%s' "https://www.virustotal.com/gui/file/$sha256/detection" > "${outprefix}.url"
+            printf '%s' "$result_status" > "${outprefix}.status"
+          }
+          upload_and_poll "artifacts/plainapp-cli-macos-arm64"        /tmp/vt_arm64      &
+          upload_and_poll "artifacts/plainapp-cli-macos-x86_64"       /tmp/vt_x86_64_mac &
+          upload_and_poll "artifacts/plainapp-cli-linux-x86_64"       /tmp/vt_linux      &
+          upload_and_poll "artifacts/plainapp-cli-windows-x86_64.exe" /tmp/vt_windows    &
+          wait
+          {
+            echo "arm64_report=$(cat /tmp/vt_arm64.url)"
+            echo "arm64_status=$(cat /tmp/vt_arm64.status)"
+            echo "x86_64_mac_report=$(cat /tmp/vt_x86_64_mac.url)"
+            echo "x86_64_mac_status=$(cat /tmp/vt_x86_64_mac.status)"
+            echo "linux_report=$(cat /tmp/vt_linux.url)"
+            echo "linux_status=$(cat /tmp/vt_linux.status)"
+            echo "windows_report=$(cat /tmp/vt_windows.url)"
+            echo "windows_status=$(cat /tmp/vt_windows.status)"
+          } >> $GITHUB_OUTPUT
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [provenance, virustotal]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      release_url: ${{ steps.publish.outputs.url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -93,22 +208,24 @@ jobs:
           VER=$(grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $2}')
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.provenance.outputs.provenance-name }}
 
       - name: Compute SHA-256 checksums
         run: |
-          cd artifacts
-          find . -type f | sort | xargs sha256sum > ../checksums.txt
-          cat ../checksums.txt
+          sha256sum artifacts/* ${{ needs.provenance.outputs.provenance-name }} > checksums.txt
+          cat checksums.txt
 
       - name: Publish GitHub Release (draft)
-        id: publish
-        uses: softprops/action-gh-release@v2
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: v${{ steps.meta.outputs.version }}
+          tag: v${{ steps.meta.outputs.version }}
           name: plainapp-cli v${{ steps.meta.outputs.version }}
           body: |
             ## Install
@@ -124,10 +241,27 @@ jobs:
             sudo mv plainapp-cli-* /usr/local/bin/plainapp-cli
             ```
 
+            ## Security
+
+            ### VirusTotal Scan
+            | File | Status | Scan Report |
+            |------|--------|-------------|
+            | `plainapp-cli-macos-arm64`        | ${{ needs.virustotal.outputs.arm64_status }}      | [View Report](${{ needs.virustotal.outputs.arm64_report }}) |
+            | `plainapp-cli-macos-x86_64`       | ${{ needs.virustotal.outputs.x86_64_mac_status }} | [View Report](${{ needs.virustotal.outputs.x86_64_mac_report }}) |
+            | `plainapp-cli-linux-x86_64`       | ${{ needs.virustotal.outputs.linux_status }}      | [View Report](${{ needs.virustotal.outputs.linux_report }}) |
+            | `plainapp-cli-windows-x86_64.exe` | ${{ needs.virustotal.outputs.windows_status }}    | [View Report](${{ needs.virustotal.outputs.windows_report }}) |
+
+            ### SLSA Provenance (Level 3)
+            The `.intoto.jsonl` file is a signed SLSA provenance document covering all release binaries.
+            Verify with [slsa-verifier](https://github.com/slsa-framework/slsa-verifier):
+            ```sh
+            slsa-verifier verify-artifact plainapp-cli-linux-x86_64 \
+              --provenance-path ${{ needs.provenance.outputs.provenance-name }} \
+              --source-uri github.com/${{ github.repository }}
+            ```
+
             ## Checksums (SHA-256)
             See `checksums.txt` attached below.
-          files: |
-            artifacts/**/*
-            checksums.txt
           draft: true
           prerelease: false
+          artifacts: "artifacts/*,${{ needs.provenance.outputs.provenance-name }},checksums.txt"
