@@ -1,0 +1,9 @@
+/target
+
+# User's local config (contains secret token)
+config.toml
+
+# Editor / OS artifacts
+.DS_Store
+*.swp
+*.swo
